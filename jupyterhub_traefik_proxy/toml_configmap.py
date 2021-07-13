@@ -24,6 +24,7 @@ import asyncio
 import string
 import escapism
 import kubernetes
+import toml
 from kubernetes.client.exceptions import ApiException
 
 from traitlets import Any, default, Unicode
@@ -46,76 +47,16 @@ class TraefikTomlConfigmapProxy(TraefikProxy):
     def _default_mutex(self):
         return asyncio.Lock()
 
-    # TODO: remove
-    toml_dynamic_config_file = Unicode(
-        "rules.toml", config=True, help="""traefik's dynamic configuration file"""
-    )
-    
     v1 = None
-
+    in_cluster = False
     cm_name = "traefik-rules"
     cm_namespace = "default"
 
-
-    def _ensure_configmap(self):
-        exists = False
-        try:
-            self.v1.read_namespaced_config_map(
-                namespace=self.cm_namespace,
-                name=self.cm_name,
-            )
-            exists = True
-        except ApiException as err:
-            if err.status != "404":
-                raise err
-        
-        if not exists:
-            self.v1.create_namespaced_config_map(
-                namespace=self.cm_namespace,
-                body=client.V1ConfigMap(
-                    api_version="v1",
-                    kind="ConfigMap",
-                    metadata=client.V1ObjectMeta(
-                        name=self.cm_name,
-                        namespace=self.cm_namespace,
-                    ),
-                    data={
-                        "rules.toml": ""
-                    },
-                ),
-            )
-
-    def __init__(self, **kwargs):
-        config.load_kube_config()
-        # config.load_incluster_config()
-        self.v1 = client.CoreV1Api()
-
-        self._ensure_configmap()
-        # cm = self.v1.read_namespaced_config_map(
-        #     name="traefik-rules",
-        #     namespace="default",
-        # )
-        # self.v1.replace_namespaced_config_map(
-        #     name="traefik-rules",
-        #     namespace="default",
-        #     body={},
-        # )
-
-        super().__init__(**kwargs)
-        try:
-            # Load initial routing table from disk
-            # TODO: rewrite to read from configmap (cache?)
-            self.routes_cache = traefik_utils.load_routes(self.toml_dynamic_config_file)
-        except FileNotFoundError:
-            self.routes_cache = {}
-
-        if not self.routes_cache:
-            self.routes_cache = {"backends": {}, "frontends": {}}
-
-    # TODO: rewrite to read from configmap (cache?)
     def _get_route_unsafe(self, traefik_routespec):
-        backend_alias = traefik_utils.generate_alias(traefik_routespec, "backend")
-        frontend_alias = traefik_utils.generate_alias(traefik_routespec, "frontend")
+        backend_alias = traefik_utils.generate_alias(
+            traefik_routespec, "backend")
+        frontend_alias = traefik_utils.generate_alias(
+            traefik_routespec, "frontend")
         routespec = self._routespec_from_traefik_path(traefik_routespec)
         result = {"data": "", "target": "", "routespec": routespec}
 
@@ -133,10 +74,12 @@ class TraefikTomlConfigmapProxy(TraefikProxy):
                     get_target_data(v, to_find)
 
         if backend_alias in self.routes_cache["backends"]:
-            get_target_data(self.routes_cache["backends"][backend_alias], "url")
+            get_target_data(
+                self.routes_cache["backends"][backend_alias], "url")
 
         if frontend_alias in self.routes_cache["frontends"]:
-            get_target_data(self.routes_cache["frontends"][frontend_alias], "data")
+            get_target_data(
+                self.routes_cache["frontends"][frontend_alias], "data")
 
         if not result["data"] and not result["target"]:
             self.log.info("No route for {} found!".format(routespec))
@@ -144,6 +87,68 @@ class TraefikTomlConfigmapProxy(TraefikProxy):
         else:
             result["data"] = json.loads(result["data"])
         return result
+
+    def _ensure_configmap(self):
+        try:
+            self.v1.read_namespaced_config_map(
+                namespace=self.cm_namespace,
+                name=self.cm_name,
+            )
+        
+        except client.rest.ApiException as apiEx:
+            if apiEx.reason == 'Not Found':
+                print("Configmap not found, generating one")
+                self.v1.create_namespaced_config_map(
+                    namespace=self.cm_namespace,
+                    body=client.V1ConfigMap(
+                        api_version="v1",
+                        kind="ConfigMap",
+                        metadata=client.V1ObjectMeta(
+                            name=self.cm_name,
+                            namespace=self.cm_namespace,
+                        ),
+                        data={
+                            "rules.toml": toml.dumps({"backends": {}, "frontends": {}})
+                        },
+                    ),
+                )
+
+            else:
+                raise apiEx
+
+    def _persist_routes_cache(self):
+        '''
+        This method persists the routes_cache dict to a configmap as a formatted TOML string.
+        WARN: Only call this function while self.mutex is locked.
+        '''
+        self.v1.patch_namespaced_config_map(
+            name=self.cm_name,
+            namespace=self.cm_namespace,
+            body=client.V1ConfigMap(
+                api_version="v1",
+                kind="ConfigMap",
+                metadata=client.V1ObjectMeta(
+                    name=self.cm_name,
+                    namespace=self.cm_namespace,
+                ),
+                data={
+                    "rules.toml": toml.dumps(self.routes_cache)
+                },
+            ),
+        )
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        
+        if self.in_cluster:
+            config.load_incluster_config()
+        else:
+            config.load_kube_config()
+        
+        self.v1 = client.CoreV1Api()
+
+        self._ensure_configmap()
+        self.routes_cache = toml.loads(self.v1.read_namespaced_config_map(name=self.cm_name, namespace=self.cm_namespace).data['rules.toml'])
 
     # TODO: rewrite to write to configmap (cache?)
     async def add_route(self, routespec, target, data):
@@ -180,28 +185,15 @@ class TraefikTomlConfigmapProxy(TraefikProxy):
             self.routes_cache["backends"][backend_alias] = {
                 "servers": {"server1": {"url": target, "weight": 1}}
             }
-            traefik_utils.persist_routes(
-                self.toml_dynamic_config_file, self.routes_cache
-            )
-
-        if self.should_start:
-            try:
-                # Check if traefik was launched
-                pid = self.traefik_process.pid
-            except AttributeError:
-                self.log.error(
-                    "You cannot add routes if the proxy isn't running! Please start the proxy: proxy.start()"
-                )
-                raise
+            self._persist_routes_cache()
         try:
             await self._wait_for_route(routespec, provider="file")
         except TimeoutError:
             self.log.error(
-                f"Is Traefik configured to watch {self.toml_dynamic_config_file}?"
+                f"Is Traefik configured to watch the configmap {self.cm_name}?"
             )
             raise
 
-    # TODO: rewrite to write to configmap (cache?)
     async def delete_route(self, routespec):
         """Delete a route with a given routespec if it exists.
 
@@ -214,10 +206,8 @@ class TraefikTomlConfigmapProxy(TraefikProxy):
         async with self.mutex:
             self.routes_cache["frontends"].pop(frontend_alias, None)
             self.routes_cache["backends"].pop(backend_alias, None)
+            self._persist_routes_cache()
 
-        traefik_utils.persist_routes(self.toml_dynamic_config_file, self.routes_cache)
-
-    # TODO: rewrite to read from configmap (cache?)
     async def get_all_routes(self):
         """Fetch and return all the routes associated by JupyterHub from the
         proxy.
@@ -234,37 +224,10 @@ class TraefikTomlConfigmapProxy(TraefikProxy):
           }
         """
         all_routes = {}
-
         async with self.mutex:
             for key, value in self.routes_cache["frontends"].items():
                 escaped_routespec = "".join(key.split("_", 1)[1:])
                 traefik_routespec = escapism.unescape(escaped_routespec)
                 routespec = self._routespec_from_traefik_path(traefik_routespec)
                 all_routes[routespec] = self._get_route_unsafe(traefik_routespec)
-
         return all_routes
-
-    # TODO: rewrite to read from configmap (cache?)
-    async def get_route(self, routespec):
-        """Return the route info for a given routespec.
-
-        Args:
-            routespec (str):
-                A URI that was used to add this route,
-                e.g. `host.tld/path/`
-
-        Returns:
-            result (dict):
-                dict with the following keys::
-
-                'routespec': The normalized route specification passed in to add_route
-                    ([host]/path/)
-                'target': The target host for this route (proto://host)
-                'data': The arbitrary data dict that was passed in by JupyterHub when adding this
-                        route.
-
-            None: if there are no routes matching the given routespec
-        """
-        routespec = self._routespec_to_traefik_path(routespec)
-        async with self.mutex:
-            return self._get_route_unsafe(routespec)
