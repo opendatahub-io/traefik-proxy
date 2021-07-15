@@ -32,7 +32,7 @@ from jupyterhub.proxy import Proxy
 from jupyterhub_traefik_proxy import TraefikProxy
 
 from kubernetes import client, config
-from kubernetes.client import ApiException
+from kubernetes.client.rest import ApiException
 
 class TraefikTomlConfigmapProxy(TraefikProxy):
     """JupyterHub Proxy implementation using traefik and toml config file stored in a configmap"""
