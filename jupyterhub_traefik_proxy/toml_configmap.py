@@ -47,9 +47,9 @@ class TraefikTomlConfigmapProxy(TraefikProxy):
         return asyncio.Lock()
 
     v1 = None
-    in_cluster = False
+    in_cluster = True
     cm_name = "traefik-rules"
-    cm_namespace = "default"
+    cm_namespace = "proxy-poc"
 
     def _get_route_unsafe(self, traefik_routespec):
         backend_alias = traefik_utils.generate_alias(
@@ -93,7 +93,7 @@ class TraefikTomlConfigmapProxy(TraefikProxy):
                 namespace=self.cm_namespace,
                 name=self.cm_name,
             )
-        
+
         except client.rest.ApiException as apiEx:
             if apiEx.reason == 'Not Found':
                 print("Configmap not found, generating one")
@@ -138,12 +138,12 @@ class TraefikTomlConfigmapProxy(TraefikProxy):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        
+
         if self.in_cluster:
             config.load_incluster_config()
         else:
             config.load_kube_config()
-        
+
         self.v1 = client.CoreV1Api()
 
         self._ensure_configmap()
