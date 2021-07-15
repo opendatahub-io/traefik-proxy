@@ -23,9 +23,7 @@ import os
 import asyncio
 import string
 import escapism
-import kubernetes
 import toml
-from kubernetes.client.exceptions import ApiException
 
 from traitlets import Any, default, Unicode
 
@@ -34,6 +32,7 @@ from jupyterhub.proxy import Proxy
 from jupyterhub_traefik_proxy import TraefikProxy
 
 from kubernetes import client, config
+from kubernetes.client.rest import ApiException
 
 class TraefikTomlConfigmapProxy(TraefikProxy):
     """JupyterHub Proxy implementation using traefik and toml config file stored in a configmap"""
