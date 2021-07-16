@@ -24,8 +24,9 @@ import asyncio
 import string
 import escapism
 import toml
+import time
 
-from traitlets import Any, default, Unicode
+from traitlets import Any, default, Unicode, Bool
 
 from . import traefik_utils
 from jupyterhub.proxy import Proxy
@@ -47,9 +48,17 @@ class TraefikTomlConfigmapProxy(TraefikProxy):
         return asyncio.Lock()
 
     v1 = None
-    in_cluster = True
-    cm_name = "traefik-rules"
-    cm_namespace = "proxy-poc"
+    in_cluster = Bool(
+        True, config=True, help="""Should proxy use the in-cluster kubernetes config?"""
+    )
+
+    cm_name = Unicode(
+        "traefik-rules", config=True, help="""Name of configmap in which traefik will read the rules.toml file"""
+    )
+
+    cm_namespace = Unicode(
+        "default", config=True, help="""Namespace in which the configmap for traefik-rules will be created and updated"""
+    )
 
     def _get_route_unsafe(self, traefik_routespec):
         backend_alias = traefik_utils.generate_alias(
@@ -135,6 +144,7 @@ class TraefikTomlConfigmapProxy(TraefikProxy):
                 },
             ),
         )
+        time.sleep(5)
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -149,7 +159,6 @@ class TraefikTomlConfigmapProxy(TraefikProxy):
         self._ensure_configmap()
         self.routes_cache = toml.loads(self.v1.read_namespaced_config_map(name=self.cm_name, namespace=self.cm_namespace).data['rules.toml'])
 
-    # TODO: rewrite to write to configmap (cache?)
     async def add_route(self, routespec, target, data):
         """Add a route to the proxy.
 
