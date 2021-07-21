@@ -148,12 +148,6 @@ class TraefikTomlConfigmapProxy(TraefikProxy):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
-        # i think these can go away since jupyterhub-odh loads config too
-        # if self.in_cluster:
-        #     config.load_incluster_config()
-        # else:
-        #     config.load_kube_config()
-
         self.v1 = client.CoreV1Api()
 
         self._ensure_configmap()
