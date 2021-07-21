@@ -145,6 +145,29 @@ class TraefikTomlConfigmapProxy(TraefikProxy):
             ),
         )
 
+    async def _wait_for_route_in_traefik_pods(self, routespec):
+        self.log.info("Waiting for %s to register with all traefik pods", routespec)
+
+        # - resolve traefik svc/eps to pods
+        # - hope that traefik svc endpoints didn't race in a new pod
+        # - for each pod: run previous procedure
+
+        endpoints = await self.v1.read_namespaced_endpoints(
+            name=self.traefik_svc_name,
+            namespace=self.traefik_svc_namespace,
+            async_req=True
+        )
+
+        pod_ips = []
+        for subset in endpoints.subsets:
+            for address in subset.adresses:
+                if address.targetRef['kind'] != "Pod":
+                    continue
+                pod_ips.append(address.ip)
+        
+        print("pod_ips", pod_ips)
+        return
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
@@ -198,6 +221,9 @@ class TraefikTomlConfigmapProxy(TraefikProxy):
         # available in one of many traefik pods.
         # let's see if racyness can be "reasonably" avoided by adding
         # a delay and then checking for the routes multiple times
+
+        await self._wait_for_route_in_traefik_pods(routespec)
+
         time.sleep(15)
         try:
             for _ in range(10): await self._wait_for_route(routespec, provider="file")
