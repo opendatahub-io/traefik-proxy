@@ -144,7 +144,6 @@ class TraefikTomlConfigmapProxy(TraefikProxy):
                 },
             ),
         )
-        time.sleep(5)
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -194,8 +193,20 @@ class TraefikTomlConfigmapProxy(TraefikProxy):
                 "servers": {"server1": {"url": target, "weight": 1}}
             }
             self._persist_routes_cache()
+
+        # dirty hack time!
+        # ideally this is replaced by an implementation
+        # that is aware of all traefik pods
+        # and checks all of them for the route
+        # racyness: after this function completes, jupyterhub assumes
+        # that the route is avaiable when, in fact, it is maybe only
+        # available in one of many traefik pods.
+        # let's see if racyness can be "reasonably" avoided by adding
+        # a delay and then checking for the routes multiple times
+        time.sleep(15)
         try:
-            await self._wait_for_route(routespec, provider="file")
+            for _ in range(10): await self._wait_for_route(routespec, provider="file")
+
         except TimeoutError:
             self.log.error(
                 f"Is Traefik configured to watch the configmap {self.cm_name}?"
