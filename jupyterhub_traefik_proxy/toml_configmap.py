@@ -222,6 +222,7 @@ class TraefikTomlConfigmapProxy(TraefikProxy):
         # let's see if racyness can be "reasonably" avoided by adding
         # a delay and then checking for the routes multiple times
 
+        print("check time")
         await self._wait_for_route_in_traefik_pods(routespec)
 
         time.sleep(15)
