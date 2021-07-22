@@ -22,6 +22,7 @@ import json
 import asyncio
 import escapism
 import toml
+from urllib.parse import urlparse
 
 from traitlets import Any, default, Unicode, Bool
 
@@ -65,195 +66,6 @@ class TraefikTomlConfigmapProxy(TraefikProxy):
     traefik_svc_namespace = Unicode(
         "opendatahub", config=True, help="""Name of service for traefik"""
     )
-
-    def _get_route_unsafe(self, traefik_routespec):
-        backend_alias = traefik_utils.generate_alias(
-            traefik_routespec, "backend")
-        frontend_alias = traefik_utils.generate_alias(
-            traefik_routespec, "frontend")
-        routespec = self._routespec_from_traefik_path(traefik_routespec)
-        result = {"data": "", "target": "", "routespec": routespec}
-
-        def get_target_data(d, to_find):
-            if to_find == "url":
-                key = "target"
-            else:
-                key = to_find
-            if result[key]:
-                return
-            for k, v in d.items():
-                if k == to_find:
-                    result[key] = v
-                if isinstance(v, dict):
-                    get_target_data(v, to_find)
-
-        if backend_alias in self.routes_cache["backends"]:
-            get_target_data(
-                self.routes_cache["backends"][backend_alias], "url")
-
-        if frontend_alias in self.routes_cache["frontends"]:
-            get_target_data(
-                self.routes_cache["frontends"][frontend_alias], "data")
-
-        if not result["data"] and not result["target"]:
-            self.log.info("No route for {} found!".format(routespec))
-            result = None
-        else:
-            result["data"] = json.loads(result["data"])
-        return result
-
-    def _ensure_configmap(self):
-        try:
-            self.v1.read_namespaced_config_map(
-                namespace=self.cm_namespace,
-                name=self.cm_name,
-            )
-
-        except client.rest.ApiException as apiEx:
-            if apiEx.reason == 'Not Found':
-                self.log.info("Configmap not found, generating one")
-                self.v1.create_namespaced_config_map(
-                    namespace=self.cm_namespace,
-                    body=client.V1ConfigMap(
-                        api_version="v1",
-                        kind="ConfigMap",
-                        metadata=client.V1ObjectMeta(
-                            name=self.cm_name,
-                            namespace=self.cm_namespace,
-                        ),
-                        data={
-                            "rules.toml": toml.dumps({"backends": {}, "frontends": {}})
-                        },
-                    ),
-                )
-
-            else:
-                raise apiEx
-
-    def _persist_routes_cache(self):
-        '''
-        This method persists the routes_cache dict to a configmap as a formatted TOML string.
-        WARN: Only call this function while self.mutex is locked.
-        '''
-        self.v1.patch_namespaced_config_map(
-            name=self.cm_name,
-            namespace=self.cm_namespace,
-            body=client.V1ConfigMap(
-                api_version="v1",
-                kind="ConfigMap",
-                metadata=client.V1ObjectMeta(
-                    name=self.cm_name,
-                    namespace=self.cm_namespace,
-                ),
-                data={
-                    "rules.toml": toml.dumps(self.routes_cache)
-                },
-            ),
-        )
-
-    def _resolve_traefik_pod_ips(self):
-        endpoints = self.v1.read_namespaced_endpoints(
-            name=self.traefik_svc_name,
-            namespace=self.traefik_svc_namespace,
-        )
-
-        pod_ips = []
-        for subset in endpoints.subsets:
-            for address in subset.addresses:
-                if address.target_ref.kind != "Pod":
-                    continue
-                pod_ips.append(address.ip)
-        return pod_ips
-
-    async def _wait_for_route_in_traefik_all_pods(self, routespec, tries_left = 3):
-        self.log.info("Waiting for %s to register with all traefik pods - tries left: %d", routespec, tries_left)
-
-        if tries_left < 1:
-            raise Exception("Could not wait for route in traefikpods: retries exhausted")
-
-        # - resolve traefik svc/eps to pods
-        # - hope that traefik svc endpoints didn't race in a new pod and that no resolved pod goes away
-        # - for each pod: loop until route is available
-
-        pod_ips = self._resolve_traefik_pod_ips()
-        
-        self.log.info("resolved service to traefik pod ips: %s", pod_ips)
-
-        try:
-            for pod_ip in pod_ips:
-                self.log.debug("checking traefik pod: %s", pod_ip)
-                await self._wait_for_route_in_single_traefik_pod(routespec, pod_ip)
-                self.log.debug("successfully checked traefik pod: %s", pod_ip)
-            self.log.debug("successfully checked all traefik pods")
-        except HTTPError:
-            self.log.exception("encountered an HTTPError - retrying")
-            await self._wait_for_route_in_traefik_all_pods(routespec, tries_left - 1)
-        return
-
-    async def _wait_for_route_in_single_traefik_pod(self, routespec, pod_ip):
-        self.log.info("Waiting for %s to register with traefik pod %s", routespec, pod_ip)
-
-        async def _check_traefik_dynamic_conf_ready_in_pod():
-            """Check if traefik loaded its dynamic configuration yet"""
-            if not await self._check_pod_for_traefik_endpoint(
-                routespec, "backend", pod_ip
-            ):
-                return False
-            if not await self._check_pod_for_traefik_endpoint(
-                routespec, "frontend", pod_ip
-            ):
-                return False
-
-            return True
-
-        await exponential_backoff(
-            _check_traefik_dynamic_conf_ready_in_pod,
-            "Traefik route for {} configuration not available in pod {}".format(routespec, pod_ip),
-            timeout=self.check_route_timeout,
-        )
-
-    async def _check_pod_for_traefik_endpoint(self, routespec, kind, pod_ip):
-        """Check for an expected frontend or backend
-
-        This is used to wait for traefik to load configuration
-        from a provider
-        """
-        expected = traefik_utils.generate_alias(routespec, kind)
-        path = "/api/providers/file/{}s".format(kind)
-        try:
-            resp = await self._traefik_pod_api_request(pod_ip, path)
-            data = json.loads(resp.body)
-        except HTTPError as e:
-            self.log.exception("HTTPError checking traefik pod api (ip: %s) for %s %s", pod_ip, kind, routespec, e)
-            # reraise http errors
-            raise e
-        except Exception:
-            self.log.exception("Error checking traefik pod api (ip: %s) for %s %s", pod_ip, kind, routespec)
-            return False
-
-        if expected not in data:
-            self.log.debug("traefik %s not yet in %ss, pod_ip: ", expected, kind, pod_ip)
-            self.log.debug("Current traefik %ss: %s, pod_ip: ", kind, data, pod_ip)
-            return False
-
-        # found the expected endpoint
-        return True
-
-    async def _traefik_pod_api_request(self, pod_ip, path):
-        """Make an API request to a traefik pod"""
-        
-        # extract api port from `self.traefik_api_url`
-        url = url_path_join("http://{}:{}".format(pod_ip, urlparse(self.traefik_api_url).port), path)
-        
-        self.log.debug("Fetching traefik api %s", url)
-        resp = await AsyncHTTPClient().fetch(
-            url,
-            auth_username=self.traefik_api_username,
-            auth_password=self.traefik_api_password,
-            validate_cert=self.traefik_api_validate_cert,
-        )
-        self.log.debug("%s GET %s", resp.code, url)
-        return resp
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -344,3 +156,202 @@ class TraefikTomlConfigmapProxy(TraefikProxy):
                 routespec = self._routespec_from_traefik_path(traefik_routespec)
                 all_routes[routespec] = self._get_route_unsafe(traefik_routespec)
         return all_routes
+
+
+    def _get_route_unsafe(self, traefik_routespec):
+        backend_alias = traefik_utils.generate_alias(
+            traefik_routespec, "backend")
+        frontend_alias = traefik_utils.generate_alias(
+            traefik_routespec, "frontend")
+        routespec = self._routespec_from_traefik_path(traefik_routespec)
+        result = {"data": "", "target": "", "routespec": routespec}
+
+        def get_target_data(d, to_find):
+            if to_find == "url":
+                key = "target"
+            else:
+                key = to_find
+            if result[key]:
+                return
+            for k, v in d.items():
+                if k == to_find:
+                    result[key] = v
+                if isinstance(v, dict):
+                    get_target_data(v, to_find)
+
+        if backend_alias in self.routes_cache["backends"]:
+            get_target_data(
+                self.routes_cache["backends"][backend_alias], "url")
+
+        if frontend_alias in self.routes_cache["frontends"]:
+            get_target_data(
+                self.routes_cache["frontends"][frontend_alias], "data")
+
+        if not result["data"] and not result["target"]:
+            self.log.info("No route for {} found!".format(routespec))
+            result = None
+        else:
+            result["data"] = json.loads(result["data"])
+        return result
+
+    def _ensure_configmap(self):
+        """
+        Checks if the configured configmap exists and creates it if it was nonexistent.
+        """
+        try:
+            self.v1.read_namespaced_config_map(
+                namespace=self.cm_namespace,
+                name=self.cm_name,
+            )
+
+        except client.rest.ApiException as apiEx:
+            if apiEx.reason == 'Not Found':
+                self.log.info("Configmap not found, generating one")
+                self.v1.create_namespaced_config_map(
+                    namespace=self.cm_namespace,
+                    body=client.V1ConfigMap(
+                        api_version="v1",
+                        kind="ConfigMap",
+                        metadata=client.V1ObjectMeta(
+                            name=self.cm_name,
+                            namespace=self.cm_namespace,
+                        ),
+                        data={
+                            "rules.toml": toml.dumps({"backends": {}, "frontends": {}})
+                        },
+                    ),
+                )
+
+            else:
+                raise apiEx
+
+    def _persist_routes_cache(self):
+        '''
+        This method persists the routes_cache dict to a configmap as a formatted TOML string.
+        WARN: Only call this function while self.mutex is locked.
+        '''
+        self.v1.patch_namespaced_config_map(
+            name=self.cm_name,
+            namespace=self.cm_namespace,
+            body=client.V1ConfigMap(
+                api_version="v1",
+                kind="ConfigMap",
+                metadata=client.V1ObjectMeta(
+                    name=self.cm_name,
+                    namespace=self.cm_namespace,
+                ),
+                data={
+                    "rules.toml": toml.dumps(self.routes_cache)
+                },
+            ),
+        )
+
+    async def _wait_for_route_in_traefik_all_pods(self, routespec, tries_left = 3):
+        """
+        Waits until the given routespec is available in all (currently known) traefik pods.
+        If an HTTPError is encountered, it assumes that this happened, due to a traefik pod going away
+        and it tries the whole procedure up to 3 times before bailing out.
+        """
+        self.log.info("Waiting for %s to register with all traefik pods - tries left: %d", routespec, tries_left)
+
+        if tries_left < 1:
+            raise Exception("Could not wait for route in traefikpods: retries exhausted")
+
+        # - resolve traefik svc/eps to pods
+        # - hope that traefik svc endpoints didn't race in a new pod and that no resolved pod goes away
+        # - for each pod: loop until route is available
+
+        pod_ips = self._resolve_traefik_pod_ips()
+        
+        self.log.info("resolved service to traefik pod ips: %s", pod_ips)
+
+        try:
+            for pod_ip in pod_ips:
+                self.log.debug("checking traefik pod: %s", pod_ip)
+                await self._wait_for_route_in_single_traefik_pod(routespec, pod_ip)
+                self.log.debug("successfully checked traefik pod: %s", pod_ip)
+            self.log.debug("successfully checked all traefik pods")
+        except HTTPError:
+            self.log.exception("encountered an HTTPError - retrying")
+            await self._wait_for_route_in_traefik_all_pods(routespec, tries_left - 1)
+        return
+
+    def _resolve_traefik_pod_ips(self):
+        endpoints = self.v1.read_namespaced_endpoints(
+            name=self.traefik_svc_name,
+            namespace=self.traefik_svc_namespace,
+        )
+
+        pod_ips = []
+        for subset in endpoints.subsets:
+            for address in subset.addresses:
+                if address.target_ref.kind != "Pod":
+                    continue
+                pod_ips.append(address.ip)
+        return pod_ips
+
+    async def _wait_for_route_in_single_traefik_pod(self, routespec, pod_ip):
+        self.log.info("Waiting for %s to register with traefik pod %s", routespec, pod_ip)
+
+        async def _check_traefik_dynamic_conf_ready_in_pod():
+            """Check if traefik loaded its dynamic configuration yet"""
+            if not await self._check_pod_for_traefik_endpoint(
+                routespec, "backend", pod_ip
+            ):
+                return False
+            if not await self._check_pod_for_traefik_endpoint(
+                routespec, "frontend", pod_ip
+            ):
+                return False
+
+            return True
+
+        await exponential_backoff(
+            _check_traefik_dynamic_conf_ready_in_pod,
+            "Traefik route for {} configuration not available in pod {}".format(routespec, pod_ip),
+            timeout=self.check_route_timeout,
+        )
+
+    async def _check_pod_for_traefik_endpoint(self, routespec, kind, pod_ip):
+        """Check for an expected frontend or backend in a single traefik pod
+
+        This is used to wait for a single traefik pod to load configuration
+        """
+        expected = traefik_utils.generate_alias(routespec, kind)
+        path = "/api/providers/file/{}s".format(kind)
+        try:
+            resp = await self._traefik_pod_api_request(pod_ip, path)
+            data = json.loads(resp.body)
+        except HTTPError as e:
+            # reraise http errors - because `self._wait_for_route_in_traefik_all_pods` handles them
+            # 599 is `No route to host` - this is probably due to a traefik pod spinning down
+            if e.code != 599:
+                self.log.exception("HTTPError checking traefik pod api (ip: %s) for %s %s", pod_ip, kind, routespec)
+            raise e
+        except Exception:
+            self.log.exception("Error checking traefik pod api (ip: %s) for %s %s", pod_ip, kind, routespec)
+            return False
+
+        if expected not in data:
+            self.log.debug("traefik %s not yet in %ss, pod_ip: ", expected, kind, pod_ip)
+            self.log.debug("Current traefik %ss: %s, pod_ip: ", kind, data, pod_ip)
+            return False
+
+        # found the expected endpoint
+        return True
+
+    async def _traefik_pod_api_request(self, pod_ip, path):
+        """Make an API request to a traefik pod"""
+        
+        # extract api port from `self.traefik_api_url`
+        url = url_path_join("http://{}:{}".format(pod_ip, urlparse(self.traefik_api_url).port), path)
+        
+        self.log.debug("Fetching traefik api %s", url)
+        resp = await AsyncHTTPClient().fetch(
+            url,
+            auth_username=self.traefik_api_username,
+            auth_password=self.traefik_api_password,
+            validate_cert=self.traefik_api_validate_cert,
+        )
+        self.log.debug("%s GET %s", resp.code, url)
+        return resp
