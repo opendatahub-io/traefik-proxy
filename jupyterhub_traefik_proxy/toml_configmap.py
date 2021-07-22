@@ -60,6 +60,14 @@ class TraefikTomlConfigmapProxy(TraefikProxy):
         "default", config=True, help="""Namespace in which the configmap for traefik-rules will be created and updated"""
     )
 
+    traefik_svc_name = Unicode(
+        "traefik-proxy", config=True, help="""Name of service for traefik"""
+    )
+
+    traefik_svc_namespace = Unicode(
+        "opendatahub", config=True, help="""Name of service for traefik"""
+    )
+
     def _get_route_unsafe(self, traefik_routespec):
         backend_alias = traefik_utils.generate_alias(
             traefik_routespec, "backend")
