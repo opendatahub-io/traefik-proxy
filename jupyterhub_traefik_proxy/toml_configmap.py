@@ -167,8 +167,8 @@ class TraefikTomlConfigmapProxy(TraefikProxy):
 
         pod_ips = []
         for subset in endpoints.subsets:
-            for address in subset.adresses:
-                if address.targetRef['kind'] != "Pod":
+            for address in subset.addresses:
+                if address.target_ref.kind != "Pod":
                     continue
                 pod_ips.append(address.ip)
         
@@ -229,7 +229,7 @@ class TraefikTomlConfigmapProxy(TraefikProxy):
         # let's see if racyness can be "reasonably" avoided by adding
         # a delay and then checking for the routes multiple times
 
-        print("check time")
+        print("check time!")
         self._wait_for_route_in_traefik_pods(routespec)
 
         time.sleep(15)
