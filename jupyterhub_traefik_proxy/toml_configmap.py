@@ -19,24 +19,19 @@ Route Specification:
 # Distributed under the terms of the Modified BSD License.
 
 import json
-import os
 import asyncio
-import string
 import escapism
 import toml
-import time
 
 from traitlets import Any, default, Unicode, Bool
 
-from tornado.httpclient import AsyncHTTPClient
+from tornado.httpclient import AsyncHTTPClient, HTTPError
 
 from . import traefik_utils
-from jupyterhub.proxy import Proxy
 from jupyterhub_traefik_proxy import TraefikProxy
 from jupyterhub.utils import exponential_backoff, url_path_join
 
-from kubernetes import client, config
-from kubernetes.client.rest import ApiException
+from kubernetes import client
 
 class TraefikTomlConfigmapProxy(TraefikProxy):
     """JupyterHub Proxy implementation using traefik and toml config file stored in a configmap"""
@@ -156,13 +151,7 @@ class TraefikTomlConfigmapProxy(TraefikProxy):
             ),
         )
 
-    async def _wait_for_route_in_traefik_pods(self, routespec):
-        self.log.info("Waiting for %s to register with all traefik pods", routespec)
-
-        # - resolve traefik svc/eps to pods
-        # - hope that traefik svc endpoints didn't race in a new pod and that no resolved pod goes away
-        # - for each pod: loop until route is available
-
+    def _resolve_traefik_pod_ips(self):
         endpoints = self.v1.read_namespaced_endpoints(
             name=self.traefik_svc_name,
             namespace=self.traefik_svc_namespace,
@@ -174,17 +163,34 @@ class TraefikTomlConfigmapProxy(TraefikProxy):
                 if address.target_ref.kind != "Pod":
                     continue
                 pod_ips.append(address.ip)
+        return pod_ips
+
+    async def _wait_for_route_in_traefik_all_pods(self, routespec, tries_left = 3):
+        self.log.info("Waiting for %s to register with all traefik pods - tries left: %d", routespec, tries_left)
+
+        if tries_left < 1:
+            raise Exception("Could not wait for route in traefikpods: retries exhausted")
+
+        # - resolve traefik svc/eps to pods
+        # - hope that traefik svc endpoints didn't race in a new pod and that no resolved pod goes away
+        # - for each pod: loop until route is available
+
+        pod_ips = self._resolve_traefik_pod_ips()
         
         self.log.info("resolved service to traefik pod ips: %s", pod_ips)
-        for pod_ip in pod_ips:
-            self.log.debug("checking traefik pod: %s", pod_ip)
-            await self._wait_for_route_in_traefik_pod(routespec, pod_ip)
-            self.log.debug("successfully checked traefik pod: %s", pod_ip)
 
-        self.log.debug("successfully checked all traefik pods")
+        try:
+            for pod_ip in pod_ips:
+                self.log.debug("checking traefik pod: %s", pod_ip)
+                await self._wait_for_route_in_single_traefik_pod(routespec, pod_ip)
+                self.log.debug("successfully checked traefik pod: %s", pod_ip)
+            self.log.debug("successfully checked all traefik pods")
+        except HTTPError:
+            self.log.exception("encountered an HTTPError - retrying")
+            await self._wait_for_route_in_traefik_all_pods(routespec, tries_left - 1)
         return
 
-    async def _wait_for_route_in_traefik_pod(self, routespec, pod_ip):
+    async def _wait_for_route_in_single_traefik_pod(self, routespec, pod_ip):
         self.log.info("Waiting for %s to register with traefik pod %s", routespec, pod_ip)
 
         async def _check_traefik_dynamic_conf_ready_in_pod():
@@ -217,6 +223,10 @@ class TraefikTomlConfigmapProxy(TraefikProxy):
         try:
             resp = await self._traefik_pod_api_request(pod_ip, path)
             data = json.loads(resp.body)
+        except HTTPError as e:
+            self.log.exception("HTTPError checking traefik pod api (ip: %s) for %s %s", pod_ip, kind, routespec, e)
+            # reraise http errors
+            raise e
         except Exception:
             self.log.exception("Error checking traefik pod api (ip: %s) for %s %s", pod_ip, kind, routespec)
             return False
@@ -240,10 +250,7 @@ class TraefikTomlConfigmapProxy(TraefikProxy):
             auth_password=self.traefik_api_password,
             validate_cert=self.traefik_api_validate_cert,
         )
-        if resp.code >= 300:
-            self.log.warning("%s GET %s", resp.code, url)
-        else:
-            self.log.debug("%s GET %s", resp.code, url)
+        self.log.debug("%s GET %s", resp.code, url)
         return resp
 
     def __init__(self, **kwargs):
@@ -291,7 +298,7 @@ class TraefikTomlConfigmapProxy(TraefikProxy):
             self._persist_routes_cache()
 
         try:
-            await self._wait_for_route_in_traefik_pods(routespec)
+            await self._wait_for_route_in_traefik_all_pods(routespec)
         except TimeoutError:
             self.log.error(
                 f"Is Traefik configured to watch the configmap {self.cm_name}?"
