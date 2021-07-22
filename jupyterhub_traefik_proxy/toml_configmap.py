@@ -47,9 +47,6 @@ class TraefikTomlConfigmapProxy(TraefikProxy):
         return asyncio.Lock()
 
     v1 = None
-    in_cluster = Bool(
-        True, config=True, help="""Should proxy use the in-cluster kubernetes config?"""
-    )
 
     cm_name = Unicode(
         "traefik-rules", config=True, help="""Name of configmap in which traefik will read the rules.toml file"""
