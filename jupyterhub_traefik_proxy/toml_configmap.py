@@ -153,17 +153,16 @@ class TraefikTomlConfigmapProxy(TraefikProxy):
             ),
         )
 
-    async def _wait_for_route_in_traefik_pods(self, routespec):
+    def _wait_for_route_in_traefik_pods(self, routespec):
         self.log.info("Waiting for %s to register with all traefik pods", routespec)
 
         # - resolve traefik svc/eps to pods
         # - hope that traefik svc endpoints didn't race in a new pod
         # - for each pod: run previous procedure
 
-        endpoints = await self.v1.read_namespaced_endpoints(
+        endpoints = self.v1.read_namespaced_endpoints(
             name=self.traefik_svc_name,
             namespace=self.traefik_svc_namespace,
-            async_req=True
         )
 
         pod_ips = []
@@ -231,7 +230,7 @@ class TraefikTomlConfigmapProxy(TraefikProxy):
         # a delay and then checking for the routes multiple times
 
         print("check time")
-        await self._wait_for_route_in_traefik_pods(routespec)
+        self._wait_for_route_in_traefik_pods(routespec)
 
         time.sleep(15)
         try:
