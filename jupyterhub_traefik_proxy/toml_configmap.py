@@ -241,8 +241,10 @@ class TraefikTomlConfigmapProxy(TraefikProxy):
 
     async def _traefik_pod_api_request(self, pod_ip, path):
         """Make an API request to a traefik pod"""
-        # TODO: extract api port from `self.traefik_api_url` and remove hardcoding
-        url = url_path_join("http://{}:8099".format(pod_ip), path)
+        
+        # extract api port from `self.traefik_api_url`
+        url = url_path_join("http://{}:{}".format(pod_ip, urlparse(self.traefik_api_url).port), path)
+        
         self.log.debug("Fetching traefik api %s", url)
         resp = await AsyncHTTPClient().fetch(
             url,
