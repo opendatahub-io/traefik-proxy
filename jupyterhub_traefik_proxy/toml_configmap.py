@@ -215,7 +215,7 @@ class TraefikTomlConfigmapProxy(TraefikProxy):
         expected = traefik_utils.generate_alias(routespec, kind)
         path = "/api/providers/file/{}s".format(kind)
         try:
-            resp = await self._traefik_api_request(pod_ip, path)
+            resp = await self._traefik_pod_api_request(pod_ip, path)
             data = json.loads(resp.body)
         except Exception:
             self.log.exception("Error checking traefik pod api (ip: %s) for %s %s", pod_ip, kind, routespec)
