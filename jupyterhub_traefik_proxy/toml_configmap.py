@@ -116,7 +116,7 @@ class TraefikTomlConfigmapProxy(TraefikProxy):
 
         except client.rest.ApiException as apiEx:
             if apiEx.reason == 'Not Found':
-                print("Configmap not found, generating one")
+                self.log.info("Configmap not found, generating one")
                 self.v1.create_namespaced_config_map(
                     namespace=self.cm_namespace,
                     body=client.V1ConfigMap(
@@ -160,8 +160,8 @@ class TraefikTomlConfigmapProxy(TraefikProxy):
         self.log.info("Waiting for %s to register with all traefik pods", routespec)
 
         # - resolve traefik svc/eps to pods
-        # - hope that traefik svc endpoints didn't race in a new pod
-        # - for each pod: run previous procedure
+        # - hope that traefik svc endpoints didn't race in a new pod and that no resolved pod goes away
+        # - for each pod: loop until route is available
 
         endpoints = self.v1.read_namespaced_endpoints(
             name=self.traefik_svc_name,
@@ -175,13 +175,13 @@ class TraefikTomlConfigmapProxy(TraefikProxy):
                     continue
                 pod_ips.append(address.ip)
         
-        print("pod_ips", pod_ips)
+        self.log.info("resolved service to traefik pod ips: %s", pod_ips)
         for pod_ip in pod_ips:
-            print("checking pod_ip: {}".format(pod_ip))
+            self.log.debug("checking traefik pod: %s", pod_ip)
             await self._wait_for_route_in_traefik_pod(routespec, pod_ip)
-            print("checked pod_ip: {}".format(pod_ip))
+            self.log.debug("successfully checked traefik pod: %s", pod_ip)
 
-        print("checked all pods :)")
+        self.log.debug("successfully checked all traefik pods")
         return
 
     async def _wait_for_route_in_traefik_pod(self, routespec, pod_ip):
@@ -290,23 +290,8 @@ class TraefikTomlConfigmapProxy(TraefikProxy):
             }
             self._persist_routes_cache()
 
-        # dirty hack time!
-        # ideally this is replaced by an implementation
-        # that is aware of all traefik pods
-        # and checks all of them for the route
-        # racyness: after this function completes, jupyterhub assumes
-        # that the route is avaiable when, in fact, it is maybe only
-        # available in one of many traefik pods.
-        # let's see if racyness can be "reasonably" avoided by adding
-        # a delay and then checking for the routes multiple times
-
-        print("check time!")
-        await self._wait_for_route_in_traefik_pods(routespec)
-
-        time.sleep(15)
         try:
-            for _ in range(10): await self._wait_for_route(routespec, provider="file")
-
+            await self._wait_for_route_in_traefik_pods(routespec)
         except TimeoutError:
             self.log.error(
                 f"Is Traefik configured to watch the configmap {self.cm_name}?"
