@@ -28,9 +28,12 @@ import time
 
 from traitlets import Any, default, Unicode, Bool
 
+from tornado.httpclient import AsyncHTTPClient
+
 from . import traefik_utils
 from jupyterhub.proxy import Proxy
 from jupyterhub_traefik_proxy import TraefikProxy
+from jupyterhub.utils import exponential_backoff, url_path_join
 
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
@@ -153,7 +156,7 @@ class TraefikTomlConfigmapProxy(TraefikProxy):
             ),
         )
 
-    def _wait_for_route_in_traefik_pods(self, routespec):
+    async def _wait_for_route_in_traefik_pods(self, routespec):
         self.log.info("Waiting for %s to register with all traefik pods", routespec)
 
         # - resolve traefik svc/eps to pods
@@ -173,7 +176,75 @@ class TraefikTomlConfigmapProxy(TraefikProxy):
                 pod_ips.append(address.ip)
         
         print("pod_ips", pod_ips)
+        for pod_ip in pod_ips:
+            print("checking pod_ip: {}".format(pod_ip))
+            await self._wait_for_route_in_traefik_pod(routespec, pod_ip)
+            print("checked pod_ip: {}".format(pod_ip))
+
+        print("checked all pods :)")
         return
+
+    async def _wait_for_route_in_traefik_pod(self, routespec, pod_ip):
+        self.log.info("Waiting for %s to register with traefik pod %s", routespec, pod_ip)
+
+        async def _check_traefik_dynamic_conf_ready_in_pod():
+            """Check if traefik loaded its dynamic configuration yet"""
+            if not await self._check_for_traefik_endpoint(
+                routespec, "backend", pod_ip
+            ):
+                return False
+            if not await self._check_for_traefik_endpoint(
+                routespec, "frontend", pod_ip
+            ):
+                return False
+
+            return True
+
+        await exponential_backoff(
+            _check_traefik_dynamic_conf_ready_in_pod,
+            "Traefik route for {} configuration not available in pod {}".format(routespec, pod_ip),
+            timeout=self.check_route_timeout,
+        )
+
+    async def _check_for_traefik_endpoint(self, routespec, kind, pod_ip):
+        """Check for an expected frontend or backend
+
+        This is used to wait for traefik to load configuration
+        from a provider
+        """
+        expected = traefik_utils.generate_alias(routespec, kind)
+        path = "/api/providers/file/{}s".format(kind)
+        try:
+            resp = await self._traefik_api_request(pod_ip, path)
+            data = json.loads(resp.body)
+        except Exception:
+            self.log.exception("Error checking traefik pod api (ip: %s) for %s %s", pod_ip, kind, routespec)
+            return False
+
+        if expected not in data:
+            self.log.debug("traefik %s not yet in %ss, pod_ip: ", expected, kind, pod_ip)
+            self.log.debug("Current traefik %ss: %s, pod_ip: ", kind, data, pod_ip)
+            return False
+
+        # found the expected endpoint
+        return True
+
+    async def _traefik_pod_api_request(self, pod_ip, path):
+        """Make an API request to a traefik pod"""
+        # TODO: extract api port from `self.traefik_api_url` and remove hardcoding
+        url = url_path_join("http://{}:8099".format(pod_ip), path)
+        self.log.debug("Fetching traefik api %s", url)
+        resp = await AsyncHTTPClient().fetch(
+            url,
+            auth_username=self.traefik_api_username,
+            auth_password=self.traefik_api_password,
+            validate_cert=self.traefik_api_validate_cert,
+        )
+        if resp.code >= 300:
+            self.log.warning("%s GET %s", resp.code, url)
+        else:
+            self.log.debug("%s GET %s", resp.code, url)
+        return resp
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -230,7 +301,7 @@ class TraefikTomlConfigmapProxy(TraefikProxy):
         # a delay and then checking for the routes multiple times
 
         print("check time!")
-        self._wait_for_route_in_traefik_pods(routespec)
+        await self._wait_for_route_in_traefik_pods(routespec)
 
         time.sleep(15)
         try:
