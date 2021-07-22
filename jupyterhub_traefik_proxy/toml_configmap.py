@@ -189,11 +189,11 @@ class TraefikTomlConfigmapProxy(TraefikProxy):
 
         async def _check_traefik_dynamic_conf_ready_in_pod():
             """Check if traefik loaded its dynamic configuration yet"""
-            if not await self._check_for_traefik_endpoint(
+            if not await self._check_pod_for_traefik_endpoint(
                 routespec, "backend", pod_ip
             ):
                 return False
-            if not await self._check_for_traefik_endpoint(
+            if not await self._check_pod_for_traefik_endpoint(
                 routespec, "frontend", pod_ip
             ):
                 return False
@@ -206,7 +206,7 @@ class TraefikTomlConfigmapProxy(TraefikProxy):
             timeout=self.check_route_timeout,
         )
 
-    async def _check_for_traefik_endpoint(self, routespec, kind, pod_ip):
+    async def _check_pod_for_traefik_endpoint(self, routespec, kind, pod_ip):
         """Check for an expected frontend or backend
 
         This is used to wait for traefik to load configuration
